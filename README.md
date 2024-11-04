@@ -1,6 +1,6 @@
-# ThoughtSpot Embedding Step-by-Step
+# ThoughtSpot Embedding Fundamentals Step-by-Step
 
-Welcome to TSE step-by-step, an introduction to ThoughtSpot Embedding. This is a self-guided course with related video
+Welcome to TSE step-by-step, an introduction to ThoughtSpot Embedding. This is a self-guided course
 content. Each section is broken down into a concrete topic along with instructions on the steps to follow and code
 examples to let you work on the steps yourself.
 
