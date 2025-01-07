@@ -4,10 +4,10 @@ import {
   Action,
   AppEmbed,
   AuthType,
+  ConversationEmbed,
   LiveboardEmbed,
   Page,
   SearchEmbed,
-  SageEmbed,
 } from "https://unpkg.com/@thoughtspot/visual-embed-sdk/dist/tsembed.es.js";
 
 // 1) - Set the tsURL to point to your ThoughtSpot instance.
@@ -42,15 +42,12 @@ const onSearch = () => {
   embed.render();
 };
 
-const onSage = () => {
-  const embed = new SageEmbed("#embed", {
+const onSpotter = () => {
+  const embed = new ConversationEmbed("#embed", {
     frameParams: {},
-    disableWorksheetChange: true,
-    hideSageAnswerHeader: true,
-    dataSource: "4d98d3f5-5c6a-44eb-82fb-d529ca20e31f",
+    worksheetId: "4d98d3f5-5c6a-44eb-82fb-d529ca20e31f",
     searchOptions: {
-      searchQuery: "top selling items",
-      executeSearch: true,
+      searchQuery: "what are my top selling products in October",
     },
   });
 
@@ -91,7 +88,7 @@ const onApplication = () => {
 // document.getElementById('element-id').addEventListener('click', eventHandler);
 
 document.getElementById("search-link").addEventListener("click", onSearch);
-document.getElementById("sage-link").addEventListener("click", onSage);
+document.getElementById("spotter-link").addEventListener("click", onSpotter);
 document
   .getElementById("liveboard-link")
   .addEventListener("click", onLiveboard);
