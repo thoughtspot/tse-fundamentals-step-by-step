@@ -4,9 +4,9 @@ import {
   Action,
   AppEmbed,
   AuthType,
-  ConversationEmbed,
   LiveboardEmbed,
   Page,
+  SageEmbed,
   SearchEmbed,
 } from "https://unpkg.com/@thoughtspot/visual-embed-sdk/dist/tsembed.es.js";
 
