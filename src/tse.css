@@ -1,0 +1,44 @@
+/*
+ * Style sheet for the TSE tutorial.  You shouldn't have to modify this file, but feel free to play
+ * around with colors, fonts, etc.
+ */
+body {
+  font-family: Optimo-Plain,Helvetica Neue,Helvetica,Arial,sans-serif;
+  background-color: white;
+  color: #1d232f;
+}
+
+h1 {
+  text-align: center;
+}
+
+#div-nav-links {
+  display: inline;
+}
+
+ul {
+  list-style: none;
+  color: white;
+  background-color: black;
+  padding: 8px;
+  height: 2em;
+}
+
+#ul-nav-links li {
+  display: inline;
+}
+
+#ul-nav-links li:hover {
+  color: black;
+  font-style: italic;
+  background-color: white;
+}
+
+#embed {
+  margin-left: 0;
+  display: block;
+  width: 100vw;
+  height: 90vh;
+  /* background-color: #EAEDF2; */
+  background-color: white;
+}
