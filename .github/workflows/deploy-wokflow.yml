@@ -1,0 +1,185 @@
+name: Deploy Workflow to All Branches
+
+on:
+  workflow_dispatch:
+    inputs:
+      workflow_path:
+        description: 'Path to the workflow file to deploy (relative to .github/workflows/)'
+        required: true
+        default: 'sync-to-public-mirror.yml'
+      workflow_content:
+        description: 'Content of the workflow file (base64 encoded)'
+        required: true
+      skip_branches:
+        description: 'Comma-separated list of branches to skip (optional)'
+        required: false
+        default: ''
+      force_deploy:
+        description: 'Force deploy even if workflow file exists'
+        required: false
+        default: 'true'
+        type: boolean
+      use_github_app:
+        description: 'Use GitHub App token instead of SSH signing (for protected branches)'
+        required: false
+        default: 'true'
+        type: boolean
+
+jobs:
+  deploy-to-all-branches:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.WORKFLOW_AUTOMATION }}
+
+      - name: Set up Git identity
+        run: |
+          # Configure git with identity
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "github-actions@github.com"
+          
+          # Disable signing by default - we'll use GitHub's verified commits instead
+          git config --global commit.gpgsign false
+
+      - name: Decode workflow content
+        run: |
+          echo "${{ github.event.inputs.workflow_content }}" | base64 -d > workflow_content.yml
+          mkdir -p .github/workflows
+          
+      - name: Get all branches and save to file
+        run: |
+          # Save branches to a file instead of environment variable
+          git branch -r | grep -v HEAD | sed 's/origin\///' > all_branches.txt
+          echo "All branches found:"
+          cat all_branches.txt
+
+      - name: Deploy workflow to all branches
+        run: |
+          WORKFLOW_PATH=".github/workflows/${{ github.event.inputs.workflow_path }}"
+          SKIP_BRANCHES="${{ github.event.inputs.skip_branches }}"
+          FORCE_DEPLOY="${{ github.event.inputs.force_deploy }}"
+          USE_GITHUB_APP="${{ github.event.inputs.use_github_app }}"
+          IFS=',' read -ra SKIP_ARRAY <<< "$SKIP_BRANCHES"
+          
+          CURRENT_BRANCH=$(git branch --show-current)
+          echo "Current branch: $CURRENT_BRANCH"
+          
+          # Process each branch from the file
+          while read branch; do
+            # Trim whitespace from branch name
+            branch=$(echo "$branch" | xargs)
+            
+            # Skip empty lines
+            if [ -z "$branch" ]; then
+              continue
+            fi
+            
+            # Check if branch is in skip list
+            SKIP=false
+            for skip_branch in "${SKIP_ARRAY[@]}"; do
+              if [ "$branch" = "$skip_branch" ]; then
+                SKIP=true
+                echo "Skipping branch: $branch (in skip list)"
+                break
+              fi
+            done
+            
+            if [ "$SKIP" = true ]; then
+              continue
+            fi
+            
+            echo "Processing branch: $branch"
+            
+            # Checkout branch
+            git checkout "$branch" || { echo "Failed to checkout $branch, skipping"; continue; }
+            
+            # Enhanced file existence check - check both tracked and untracked files
+            FILE_EXISTS=false
+            
+            # Check if the file exists on disk
+            if [ -f "$WORKFLOW_PATH" ]; then
+              echo "Workflow file exists on disk in branch $branch"
+              FILE_EXISTS=true
+            fi
+            
+            # Check if the file is untracked by git
+            UNTRACKED=$(git ls-files --others --exclude-standard "$WORKFLOW_PATH" 2>/dev/null)
+            if [ -n "$UNTRACKED" ]; then
+              echo "Workflow file exists but is untracked in branch $branch"
+              FILE_EXISTS=true
+            fi
+            
+            # Check if file is in git's index (tracked)
+            TRACKED=$(git ls-files "$WORKFLOW_PATH" 2>/dev/null)
+            if [ -n "$TRACKED" ]; then
+              echo "Workflow file is tracked by git in branch $branch"
+              FILE_EXISTS=true
+            fi
+            
+            # Act based on file existence and force_deploy flag
+            if [ "$FILE_EXISTS" = true ] && [ "$FORCE_DEPLOY" != "true" ]; then
+              echo "Workflow file exists in $branch and force_deploy is not enabled. Skipping."
+              continue
+            elif [ "$FILE_EXISTS" = true ] && [ "$FORCE_DEPLOY" = "true" ]; then
+              echo "Workflow file exists in $branch, but force_deploy is enabled. Overwriting."
+            else
+              echo "Workflow file does not exist in $branch. Creating."
+            fi
+            
+            # Create directory structure if it doesn't exist
+            mkdir -p "$(dirname "$WORKFLOW_PATH")"
+            
+            # Copy workflow file
+            cp workflow_content.yml "$WORKFLOW_PATH"
+            
+            # Add diagnostic output to verify file was created
+            echo "Verifying workflow file was created:"
+            ls -la "$WORKFLOW_PATH" || echo "Error: File not found after creation"
+            
+            # Check if file is in .gitignore
+            if grep -q "$WORKFLOW_PATH" .gitignore 2>/dev/null; then
+              echo "WARNING: The workflow path '$WORKFLOW_PATH' appears to be in .gitignore"
+              echo "This could prevent git from tracking the file"
+            fi
+            
+            # Add the file and check if it was added successfully
+            git add "$WORKFLOW_PATH"
+            if ! git ls-files --stage | grep -q "$WORKFLOW_PATH"; then
+              echo "WARNING: Failed to add file to git index. File may be ignored by gitignore rules."
+              echo "Attempting to force-add the file..."
+              git add -f "$WORKFLOW_PATH"
+            fi
+            
+            # Verify the file is now in the index
+            if git ls-files --stage | grep -q "$WORKFLOW_PATH"; then
+              echo "File successfully added to git index"
+            else
+              echo "ERROR: Still unable to add file to git index despite force-add attempt"
+              echo "This suggests a strong gitignore rule or other git configuration issue"
+              continue
+            fi
+            
+            # Commit changes
+            echo "Committing changes"
+            if ! git commit -m "Add workflow file to branch $branch"; then
+              echo "No changes to commit for $branch or commit failed"
+              continue
+            fi
+            
+            if ! git push origin "$branch"; then
+              echo "Failed to push changes to $branch"
+              echo "This branch may be protected and require verified commits."
+              continue
+            fi
+            
+            echo "Successfully deployed workflow to $branch"
+          done < all_branches.txt
+          
+          # Return to original branch
+          git checkout "$CURRENT_BRANCH"
