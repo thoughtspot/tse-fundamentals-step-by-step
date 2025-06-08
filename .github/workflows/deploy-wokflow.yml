@@ -6,7 +6,7 @@ on:
       workflow_path:
         description: 'Path to the workflow file to deploy (relative to .github/workflows/)'
         required: true
-        default: 'sync-to-public-mirror.yml'
+        default: 'workflow.yml'
       workflow_content:
         description: 'Content of the workflow file (base64 encoded)'
         required: true
@@ -69,6 +69,9 @@ jobs:
           
           CURRENT_BRANCH=$(git branch --show-current)
           echo "Current branch: $CURRENT_BRANCH"
+          
+          # Initialize tracking for successful deployments
+          echo "" > successful_deployments.txt
           
           # Process each branch from the file
           while read branch; do
@@ -179,7 +182,53 @@ jobs:
             fi
             
             echo "Successfully deployed workflow to $branch"
+            # Track successful deployment
+            echo "$branch" >> successful_deployments.txt
+            
           done < all_branches.txt
           
           # Return to original branch
           git checkout "$CURRENT_BRANCH"
+
+      - name: Trigger sync workflow if changes were made
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.WORKFLOW_AUTOMATION }}
+          script: |
+            const fs = require('fs');
+            
+            // Read successful deployments
+            let successfulBranches = [];
+            try {
+              const content = fs.readFileSync('successful_deployments.txt', 'utf8');
+              successfulBranches = content.split('\n').filter(branch => branch.trim().length > 0);
+            } catch (error) {
+              console.log('No successful deployments file found or error reading it');
+              return;
+            }
+            
+            if (successfulBranches.length === 0) {
+              console.log('No successful deployments found. Skipping sync trigger.');
+              return;
+            }
+            
+            console.log(`Triggering sync for ${successfulBranches.length} successfully modified branches:`, successfulBranches);
+            
+            // Trigger the repository dispatch event
+            const response = await github.rest.repos.createDispatchEvent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              event_type: 'sync-after-workflow-deployment',
+              client_payload: {
+                workflow_type: 'deploy',
+                workflow_path: '${{ github.event.inputs.workflow_path }}',
+                modified_branches: successfulBranches,
+                trigger_source: 'workflow-deployment',
+                run_id: '${{ github.run_id }}',
+                run_number: '${{ github.run_number }}'
+              }
+            });
+            
+            console.log('Repository dispatch event created successfully');
+            console.log('Event type: sync-after-workflow-deployment');
+            console.log('Modified branches:', successfulBranches.join(', '));

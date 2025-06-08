@@ -1,0 +1,189 @@
+name: Remove Workflow from All Branches
+
+on:
+  workflow_dispatch:
+    inputs:
+      workflow_path:
+        description: 'Path to the workflow file to remove (relative to .github/workflows/)'
+        required: true
+        default: 'workflow.yml'
+      skip_branches:
+        description: 'Comma-separated list of branches to skip (optional)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Dry run (will not make actual changes)'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  remove-from-all-branches:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          # Need to use PAT for workflow files
+          token: ${{ secrets.WORKFLOW_AUTOMATION }}
+
+      - name: Set up Git identity
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "github-actions@github.com"
+          
+      - name: Get all branches and save to file
+        run: |
+          # Save branches to a file
+          git branch -r | grep -v HEAD | sed 's/origin\///' > all_branches.txt
+          echo "All branches found:"
+          cat all_branches.txt
+
+      - name: Remove workflow from all branches
+        run: |
+          WORKFLOW_PATH=".github/workflows/${{ github.event.inputs.workflow_path }}"
+          WORKFLOW_DIR=".github/workflows"
+          GITHUB_DIR=".github"
+          SKIP_BRANCHES="${{ github.event.inputs.skip_branches }}"
+          DRY_RUN="${{ github.event.inputs.dry_run }}"
+          
+          IFS=',' read -ra SKIP_ARRAY <<< "$SKIP_BRANCHES"
+          
+          CURRENT_BRANCH=$(git branch --show-current)
+          echo "Current branch: $CURRENT_BRANCH"
+          
+          # Initialize tracking for successful removals
+          echo "" > successful_removals.txt
+          
+          # Process each branch from the file
+          while read branch; do
+            # Trim whitespace from branch name
+            branch=$(echo "$branch" | xargs)
+            
+            # Skip empty lines
+            if [ -z "$branch" ]; then
+              continue
+            fi
+            
+            # Check if branch is in skip list
+            SKIP=false
+            for skip_branch in "${SKIP_ARRAY[@]}"; do
+              if [ "$branch" = "$skip_branch" ]; then
+                SKIP=true
+                echo "Skipping branch: $branch (in skip list)"
+                break
+              fi
+            done
+            
+            if [ "$SKIP" = true ]; then
+              continue
+            fi
+            
+            echo "Processing branch: $branch"
+            
+            # Checkout branch
+            git checkout "$branch" || { echo "Failed to checkout $branch, skipping"; continue; }
+            
+            # Check if workflow file exists
+            if [ ! -f "$WORKFLOW_PATH" ]; then
+              echo "Workflow file doesn't exist in $branch. Skipping."
+              continue
+            fi
+            
+            echo "Found workflow file in branch: $branch"
+            
+            # Check if we're doing a dry run
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "DRY RUN: Would remove $WORKFLOW_PATH from branch $branch"
+              # Track this as a "would be successful" removal for dry run reporting
+              echo "$branch" >> successful_removals.txt
+              continue
+            fi
+            
+            # Remove the workflow file
+            rm "$WORKFLOW_PATH"
+            
+            # Check if workflows directory is empty
+            if [ -d "$WORKFLOW_DIR" ] && [ -z "$(ls -A $WORKFLOW_DIR)" ]; then
+              echo "Workflows directory is empty, removing it"
+              rm -rf "$WORKFLOW_DIR"
+              
+              # Check if .github directory is empty
+              if [ -d "$GITHUB_DIR" ] && [ -z "$(ls -A $GITHUB_DIR)" ]; then
+                echo "GitHub directory is empty, removing it"
+                rm -rf "$GITHUB_DIR"
+              fi
+            fi
+            
+            # Commit and push changes
+            git add -A
+            if git commit -m "Remove workflow file from branch $branch"; then
+              if git push origin "$branch"; then
+                echo "Successfully removed workflow from $branch"
+                # Track successful removal
+                echo "$branch" >> successful_removals.txt
+              else
+                echo "Failed to push changes to $branch"
+              fi
+            else
+              echo "No changes to commit for $branch"
+            fi
+            
+          done < all_branches.txt
+          
+          # Return to original branch
+          git checkout "$CURRENT_BRANCH"
+
+      - name: Trigger sync workflow if changes were made
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.WORKFLOW_AUTOMATION }}
+          script: |
+            const fs = require('fs');
+            
+            // Read successful removals
+            let successfulBranches = [];
+            try {
+              const content = fs.readFileSync('successful_removals.txt', 'utf8');
+              successfulBranches = content.split('\n').filter(branch => branch.trim().length > 0);
+            } catch (error) {
+              console.log('No successful removals file found or error reading it');
+              return;
+            }
+            
+            if (successfulBranches.length === 0) {
+              console.log('No successful removals found. Skipping sync trigger.');
+              return;
+            }
+            
+            const isDryRun = '${{ github.event.inputs.dry_run }}' === 'true';
+            
+            if (isDryRun) {
+              console.log(`DRY RUN: Would trigger sync for ${successfulBranches.length} branches:`, successfulBranches);
+              console.log('Skipping actual sync trigger due to dry run mode.');
+              return;
+            }
+            
+            console.log(`Triggering sync for ${successfulBranches.length} successfully modified branches:`, successfulBranches);
+            
+            // Trigger the repository dispatch event
+            const response = await github.rest.repos.createDispatchEvent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              event_type: 'sync-after-workflow-deployment',
+              client_payload: {
+                workflow_type: 'remove',
+                workflow_path: '${{ github.event.inputs.workflow_path }}',
+                modified_branches: successfulBranches,
+                trigger_source: 'workflow-deployment',
+                run_id: '${{ github.run_id }}',
+                run_number: '${{ github.run_number }}'
+              }
+            });
+            
+            console.log('Repository dispatch event created successfully');
+            console.log('Event type: sync-after-workflow-deployment');
+            console.log('Modified branches:', successfulBranches.join(', '));
