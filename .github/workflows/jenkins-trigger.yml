@@ -1,4 +1,4 @@
-name: Trigger Jenkins Pipeline
+name: Jenkins Trigger - Security Scan
 
 on:
   push:
@@ -8,69 +8,8 @@ on:
     types: [opened, synchronize, reopened]
 
 jobs:
-  trigger-jenkins:
-    runs-on: self-hosted
-    steps:
-      - name: Extract Repository Info
-        run: |
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            BRANCH_NAME="${GITHUB_REF#refs/heads/}"
-          else
-            BRANCH_NAME="${{ github.event.pull_request.head.ref }}"
-          fi
-          REPO_SSH_URL=$(git config --get remote.origin.url)
-          echo "repo_ssh_url=$REPO_SSH_URL" >> $GITHUB_ENV
-          echo "branch_name=$BRANCH_NAME" >> $GITHUB_ENV
-      - name: Trigger Jenkins Job & Check Status
-        run: |
-          CRUMB=$(curl -s -X GET "https://jenkins.corp.thoughtspot.com/crumbIssuer/api/json" \
-             --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_TOKEN }}" | jq -r '.crumb')
-          RESPONSE=$(curl -s -X POST "https://jenkins.corp.thoughtspot.com/generic-webhook-trigger/invoke?token=security-checks" \
-               -H "Content-Type: application/json" \
-               --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_TOKEN }}" \
-               -H "Jenkins-Crumb: $CRUMB" \
-               --data '{
-                 "GITURL": "'${{ env.repo_ssh_url }}'",
-                 "BRANCH": "'${{ env.branch_name }}'"
-               }')
-          echo "Jenkins Response: $RESPONSE"
-          # Extract Queue Item ID from the response
-          QUEUE_ID=$(echo "$RESPONSE" | jq -r '.jobs["Security/public-github-security-check"].id')
-          echo "Jenkins Queue ID: $QUEUE_ID"
-          if [ -z "$QUEUE_ID" ] || [ "$QUEUE_ID" == "null" ]; then
-            echo "Error: Failed to trigger Jenkins job"
-            exit 1
-          fi
-          # Wait for the job to start and get the Build Number
-          BUILD_NUMBER=""
-          for i in {1..30}; do
-            BUILD_NUMBER=$(curl -s "https://jenkins.corp.thoughtspot.com/queue/item/$QUEUE_ID/api/json" \
-              --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_TOKEN }}" | jq -r '.executable.number')
-            if [ "$BUILD_NUMBER" != "null" ]; then
-              break
-            fi
-            echo "Waiting for Jenkins job to start..."
-            sleep 5
-          done
-          if [ -z "$BUILD_NUMBER" ] || [ "$BUILD_NUMBER" == "null" ]; then
-            echo "Error: Jenkins job did not start"
-            exit 1
-          fi
-          echo "Jenkins Build Number: $BUILD_NUMBER"
-          # Poll the Jenkins job status
-          for i in {1..60}; do
-            STATUS=$(curl -s "https://jenkins.corp.thoughtspot.com/job/Security/job/public-github-security-check/$BUILD_NUMBER/api/json" \
-              --user "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_TOKEN }}" | jq -r '.result')
-            echo "Jenkins Build Status: $STATUS"
-            if [ "$STATUS" == "SUCCESS" ]; then
-              echo "Jenkins job completed successfully!"
-              exit 0
-            elif [ "$STATUS" == "FAILURE" ]; then
-              echo "Error: Jenkins job failed!"
-              exit 1
-            fi
-            echo "Waiting for Jenkins job to complete..."
-            sleep 10
-          done
-          echo "Error: Timed out waiting for Jenkins job to finish"
-          exit 1
+  jenkins-security-check:
+    uses: thoughtspot/workflows/.github/workflows/jenkins-trigger.yml@main
+    secrets:
+      JENKINS_USER: ${{ secrets.JENKINS_USER }}
+      JENKINS_TOKEN: ${{ secrets.JENKINS_TOKEN }}

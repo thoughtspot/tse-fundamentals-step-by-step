@@ -1,0 +1,17 @@
+name: Sonar Analysis
+
+on:
+  push:
+    branches:
+      - '**'
+      - '*'
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  sonar:
+    uses: thoughtspot/workflows/.github/workflows/sonar-scan.yml@main
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      SONAR_PROJECTKEY: ${{ secrets.SONAR_PROJECTKEY }}
