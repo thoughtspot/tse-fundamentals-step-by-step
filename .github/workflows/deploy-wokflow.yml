@@ -38,7 +38,7 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.WORKFLOW_AUTOMATION }}
 
-      - name: Set up Git identity
+      - name: Set up Git identity, authentication, and temp directories
         run: |
           # Configure git with identity
           git config --global user.name "GitHub Actions"
@@ -46,35 +46,81 @@ jobs:
           
           # Disable signing by default - we'll use GitHub's verified commits instead
           git config --global commit.gpgsign false
-
-      - name: Decode workflow content
-        run: |
-          echo "${{ github.event.inputs.workflow_content }}" | base64 -d > workflow_content.yml
-          mkdir -p .github/workflows
           
-      - name: Get all branches and save to file
-        run: |
-          # Save branches to a file instead of environment variable
-          git branch -r | grep -v HEAD | sed 's/origin\///' > all_branches.txt
-          echo "All branches found:"
-          cat all_branches.txt
+          # Configure git remote URL with authentication token for push operations
+          git remote set-url origin https://x-access-token:${{ secrets.WORKFLOW_AUTOMATION }}@github.com/${{ github.repository }}
+          
+          # Verify remote URL configuration
+          echo "Git remote URL configured:"
+          git remote get-url origin | sed 's/x-access-token:[^@]*@/x-access-token:***@/'
+          
+          # Create temp directory structure in GitHub's recommended location
+          export TEMP_DIR="${RUNNER_TEMP}/workflow_deployment"
+          mkdir -p "$TEMP_DIR"
+          echo "TEMP_DIR=$TEMP_DIR" >> $GITHUB_ENV
+          
+          # Create temp subdirectories for organized cleanup
+          mkdir -p "$TEMP_DIR/worktrees"
+          mkdir -p "$TEMP_DIR/artifacts"
+          
+          echo "Temporary directory created at: $TEMP_DIR"
 
-      - name: Deploy workflow to all branches
+      - name: Decode workflow content and prepare artifacts
+        run: |
+          # Decode workflow content to temp directory (outside git working tree)
+          echo "${{ github.event.inputs.workflow_content }}" | base64 -d > "$TEMP_DIR/artifacts/workflow_content.yml"
+          
+          # Validate decoded content
+          if [ ! -s "$TEMP_DIR/artifacts/workflow_content.yml" ]; then
+            echo "ERROR: Workflow content is empty after decoding"
+            exit 1
+          fi
+          
+          echo "Workflow content decoded successfully"
+          echo "Content size: $(wc -c < "$TEMP_DIR/artifacts/workflow_content.yml") bytes"
+
+      - name: Get all remote branches and prepare processing list
+        run: |
+          # Save branches to temp file outside git working tree
+          BRANCHES_FILE="$TEMP_DIR/artifacts/all_branches.txt"
+          
+          # Get all remote branches, excluding HEAD reference
+          git branch -r | grep -v HEAD | sed 's/origin\///' | sed 's/^[[:space:]]*//' > "$BRANCHES_FILE"
+          
+          # Validate we found branches
+          BRANCH_COUNT=$(wc -l < "$BRANCHES_FILE")
+          if [ "$BRANCH_COUNT" -eq 0 ]; then
+            echo "ERROR: No remote branches found"
+            exit 1
+          fi
+          
+          echo "Found $BRANCH_COUNT remote branches:"
+          cat "$BRANCHES_FILE"
+          
+          # Save branches file path to environment
+          echo "BRANCHES_FILE=$BRANCHES_FILE" >> $GITHUB_ENV
+
+      - name: Deploy workflow using git worktree strategy
         run: |
           WORKFLOW_PATH=".github/workflows/${{ github.event.inputs.workflow_path }}"
           SKIP_BRANCHES="${{ github.event.inputs.skip_branches }}"
           FORCE_DEPLOY="${{ github.event.inputs.force_deploy }}"
-          USE_GITHUB_APP="${{ github.event.inputs.use_github_app }}"
           IFS=',' read -ra SKIP_ARRAY <<< "$SKIP_BRANCHES"
           
           CURRENT_BRANCH=$(git branch --show-current)
           echo "Current branch: $CURRENT_BRANCH"
+          echo "Target workflow path: $WORKFLOW_PATH"
           
-          # Initialize tracking for successful deployments
-          echo "" > successful_deployments.txt
+          # Initialize tracking for successful deployments in temp directory
+          DEPLOYMENTS_LOG="$TEMP_DIR/artifacts/successful_deployments.txt"
+          echo "" > "$DEPLOYMENTS_LOG"
           
-          # Process each branch from the file
-          while read branch; do
+          # Initialize error tracking
+          ERRORS_LOG="$TEMP_DIR/artifacts/deployment_errors.txt"
+          echo "" > "$ERRORS_LOG"
+          
+          # Process each branch using worktree strategy
+          while IFS= read -r branch; do
             # Trim whitespace from branch name
             branch=$(echo "$branch" | xargs)
             
@@ -97,12 +143,70 @@ jobs:
               continue
             fi
             
+            echo "================================================================"
             echo "Processing branch: $branch"
+            echo "================================================================"
             
-            # Checkout branch
-            git checkout "$branch" || { echo "Failed to checkout $branch, skipping"; continue; }
+            # Define worktree path in temp directory
+            WORKTREE_PATH="$TEMP_DIR/worktrees/$branch"
             
-            # Enhanced file existence check - check both tracked and untracked files
+            # Cleanup any existing worktree for this branch (defensive)
+            if [ -d "$WORKTREE_PATH" ]; then
+              echo "Cleaning up existing worktree for $branch"
+              git worktree remove --force "$WORKTREE_PATH" 2>/dev/null || true
+              rm -rf "$WORKTREE_PATH" 2>/dev/null || true
+            fi
+            
+            # Check if local branch exists, create tracking branch if it doesn't
+            echo "Checking if local branch '$branch' exists..."
+            if ! git show-ref --verify --quiet refs/heads/"$branch"; then
+              echo "Local branch '$branch' does not exist. Creating tracking branch..."
+              
+              # Verify remote branch exists
+              if ! git show-ref --verify --quiet refs/remotes/origin/"$branch"; then
+                echo "ERROR: Remote branch 'origin/$branch' does not exist" | tee -a "$ERRORS_LOG"
+                echo "Skipping branch: $branch"
+                continue
+              fi
+              
+              # Create local tracking branch
+              if ! git branch --track "$branch" "origin/$branch"; then
+                echo "ERROR: Failed to create tracking branch for $branch" | tee -a "$ERRORS_LOG"
+                echo "Skipping branch: $branch"
+                continue
+              fi
+              echo "Created tracking branch '$branch' -> 'origin/$branch'"
+            else
+              echo "Local branch '$branch' already exists"
+            fi
+            
+            # Create worktree for the branch (using local branch name only)
+            echo "Creating worktree for branch: $branch"
+            if ! git worktree add "$WORKTREE_PATH" "$branch" 2>&1; then
+              echo "ERROR: Failed to create worktree for branch $branch" | tee -a "$ERRORS_LOG"
+              echo "Skipping branch: $branch"
+              continue
+            fi
+            
+            # Verify worktree was created successfully
+            if [ ! -d "$WORKTREE_PATH" ]; then
+              echo "ERROR: Worktree directory not found after creation: $WORKTREE_PATH" | tee -a "$ERRORS_LOG"
+              echo "Skipping branch: $branch"
+              continue
+            fi
+            
+            echo "Worktree created successfully at: $WORKTREE_PATH"
+            
+            # Change to worktree directory for all subsequent operations
+            cd "$WORKTREE_PATH"
+            
+            # Verify we're in the correct branch
+            ACTUAL_BRANCH=$(git branch --show-current)
+            if [ "$ACTUAL_BRANCH" != "$branch" ]; then
+              echo "WARNING: Expected branch '$branch', but worktree is on '$ACTUAL_BRANCH'"
+            fi
+            
+            # Enhanced file existence check in worktree
             FILE_EXISTS=false
             
             # Check if the file exists on disk
@@ -111,16 +215,8 @@ jobs:
               FILE_EXISTS=true
             fi
             
-            # Check if the file is untracked by git
-            UNTRACKED=$(git ls-files --others --exclude-standard "$WORKFLOW_PATH" 2>/dev/null)
-            if [ -n "$UNTRACKED" ]; then
-              echo "Workflow file exists but is untracked in branch $branch"
-              FILE_EXISTS=true
-            fi
-            
-            # Check if file is in git's index (tracked)
-            TRACKED=$(git ls-files "$WORKFLOW_PATH" 2>/dev/null)
-            if [ -n "$TRACKED" ]; then
+            # Check if the file is tracked by git
+            if git ls-files --error-unmatch "$WORKFLOW_PATH" >/dev/null 2>&1; then
               echo "Workflow file is tracked by git in branch $branch"
               FILE_EXISTS=true
             fi
@@ -128,6 +224,8 @@ jobs:
             # Act based on file existence and force_deploy flag
             if [ "$FILE_EXISTS" = true ] && [ "$FORCE_DEPLOY" != "true" ]; then
               echo "Workflow file exists in $branch and force_deploy is not enabled. Skipping."
+              cd - > /dev/null  # Return to main repo
+              git worktree remove --force "$WORKTREE_PATH" 2>/dev/null || true
               continue
             elif [ "$FILE_EXISTS" = true ] && [ "$FORCE_DEPLOY" = "true" ]; then
               echo "Workflow file exists in $branch, but force_deploy is enabled. Overwriting."
@@ -138,57 +236,131 @@ jobs:
             # Create directory structure if it doesn't exist
             mkdir -p "$(dirname "$WORKFLOW_PATH")"
             
-            # Copy workflow file
-            cp workflow_content.yml "$WORKFLOW_PATH"
+            # Copy workflow file from temp artifacts
+            cp "$TEMP_DIR/artifacts/workflow_content.yml" "$WORKFLOW_PATH"
             
-            # Add diagnostic output to verify file was created
-            echo "Verifying workflow file was created:"
-            ls -la "$WORKFLOW_PATH" || echo "Error: File not found after creation"
+            # Verify file was created successfully
+            if [ ! -f "$WORKFLOW_PATH" ]; then
+              echo "ERROR: Failed to create workflow file in worktree" | tee -a "$ERRORS_LOG"
+              cd - > /dev/null  # Return to main repo
+              git worktree remove --force "$WORKTREE_PATH" 2>/dev/null || true
+              continue
+            fi
+            
+            echo "Workflow file created successfully:"
+            ls -la "$WORKFLOW_PATH"
             
             # Check if file is in .gitignore
-            if grep -q "$WORKFLOW_PATH" .gitignore 2>/dev/null; then
+            if [ -f ".gitignore" ] && grep -q "$WORKFLOW_PATH" .gitignore 2>/dev/null; then
               echo "WARNING: The workflow path '$WORKFLOW_PATH' appears to be in .gitignore"
               echo "This could prevent git from tracking the file"
             fi
             
-            # Add the file and check if it was added successfully
+            # Add the file to git index
             git add "$WORKFLOW_PATH"
-            if ! git ls-files --stage | grep -q "$WORKFLOW_PATH"; then
-              echo "WARNING: Failed to add file to git index. File may be ignored by gitignore rules."
-              echo "Attempting to force-add the file..."
+            
+            # Verify the file was added to index
+            if ! git diff --cached --name-only | grep -q "$WORKFLOW_PATH"; then
+              echo "WARNING: File was not added to git index. Attempting force add..."
               git add -f "$WORKFLOW_PATH"
+              
+              # Final verification
+              if ! git diff --cached --name-only | grep -q "$WORKFLOW_PATH"; then
+                echo "ERROR: Unable to add file to git index despite force-add attempt" | tee -a "$ERRORS_LOG"
+                echo "File may be blocked by gitignore rules or git configuration"
+                cd - > /dev/null  # Return to main repo
+                git worktree remove --force "$WORKTREE_PATH" 2>/dev/null || true
+                continue
+              fi
             fi
             
-            # Verify the file is now in the index
-            if git ls-files --stage | grep -q "$WORKFLOW_PATH"; then
-              echo "File successfully added to git index"
-            else
-              echo "ERROR: Still unable to add file to git index despite force-add attempt"
-              echo "This suggests a strong gitignore rule or other git configuration issue"
+            echo "File successfully added to git index"
+            
+            # Commit changes in worktree
+            echo "Committing changes in worktree"
+            if ! git commit -m "Deploy workflow file: ${{ github.event.inputs.workflow_path }} to branch $branch"; then
+              echo "WARNING: No changes to commit for $branch or commit failed"
+              cd - > /dev/null  # Return to main repo
+              git worktree remove --force "$WORKTREE_PATH" 2>/dev/null || true
               continue
             fi
             
-            # Commit changes
-            echo "Committing changes"
-            if ! git commit -m "Add workflow file to branch $branch"; then
-              echo "No changes to commit for $branch or commit failed"
+            # Push changes from worktree to existing remote
+            echo "Pushing changes to origin/$branch"
+            
+            # Verify remote branch exists before pushing
+            if ! git ls-remote --heads origin "$branch" | grep -q "$branch"; then
+              echo "ERROR: Remote branch 'origin/$branch' does not exist" | tee -a "$ERRORS_LOG"
+              echo "Cannot push to non-existent remote branch. Skipping."
+              cd - > /dev/null  # Return to main repo
+              git worktree remove --force "$WORKTREE_PATH" 2>/dev/null || true
               continue
             fi
             
             if ! git push origin "$branch"; then
-              echo "Failed to push changes to $branch"
-              echo "This branch may be protected and require verified commits."
+              echo "ERROR: Failed to push changes to $branch" | tee -a "$ERRORS_LOG"
+              echo "Branch may be protected, require different authentication, or have push restrictions"
+              cd - > /dev/null  # Return to main repo
+              git worktree remove --force "$WORKTREE_PATH" 2>/dev/null || true
               continue
             fi
             
             echo "Successfully deployed workflow to $branch"
-            # Track successful deployment
-            echo "$branch" >> successful_deployments.txt
             
-          done < all_branches.txt
+            # Track successful deployment
+            echo "$branch" >> "$DEPLOYMENTS_LOG"
+            
+            # Return to main repository directory
+            cd - > /dev/null
+            
+            # Cleanup worktree for this branch
+            echo "Cleaning up worktree for $branch"
+            git worktree remove "$WORKTREE_PATH" 2>/dev/null || {
+              echo "WARNING: Standard worktree removal failed, attempting force removal"
+              git worktree remove --force "$WORKTREE_PATH" 2>/dev/null || true
+              rm -rf "$WORKTREE_PATH" 2>/dev/null || true
+            }
+            
+            echo "Branch $branch processing completed"
+            echo ""
+            
+          done < "$BRANCHES_FILE"
           
-          # Return to original branch
-          git checkout "$CURRENT_BRANCH"
+          # Copy results back to working directory for the next step
+          cp "$DEPLOYMENTS_LOG" "./successful_deployments.txt"
+          cp "$ERRORS_LOG" "./deployment_errors.txt" 2>/dev/null || touch "./deployment_errors.txt"
+          
+          echo "================================================================"
+          echo "Deployment Summary"
+          echo "================================================================"
+          SUCCESSFUL_COUNT=$(grep -c . "./successful_deployments.txt" 2>/dev/null || echo "0")
+          echo "Successfully deployed to $SUCCESSFUL_COUNT branches"
+          
+          if [ -s "./deployment_errors.txt" ]; then
+            echo "Errors encountered during deployment:"
+            cat "./deployment_errors.txt"
+          fi
+
+      - name: Cleanup temp directories
+        if: always()
+        run: |
+          echo "Performing cleanup of temporary directories"
+          
+          # Force cleanup any remaining worktrees
+          if [ -d "$TEMP_DIR/worktrees" ]; then
+            for worktree_dir in "$TEMP_DIR/worktrees"/*; do
+              if [ -d "$worktree_dir" ]; then
+                worktree_name=$(basename "$worktree_dir")
+                echo "Force cleaning remaining worktree: $worktree_name"
+                git worktree remove --force "$worktree_dir" 2>/dev/null || true
+              fi
+            done
+          fi
+          
+          # Remove temp directory
+          rm -rf "$TEMP_DIR" 2>/dev/null || true
+          
+          echo "Cleanup completed"
 
       - name: Trigger sync workflow if changes were made
         uses: actions/github-script@v6
