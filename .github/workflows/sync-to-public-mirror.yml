@@ -7,32 +7,45 @@ on:
   workflow_dispatch:
     inputs:
       force_sync:
-        description: 'Force sync all branches'
+        description: 'Force sync all branches (WARNING: This will sync all branches)'
         required: false
-        default: 'true'
+        default: false  # CRITICAL FIX: Changed from 'true' to false
         type: boolean
       public_repo_name:
         description: 'Public repository name (leave empty to auto-derive by removing "-private")'
         required: false
         type: string
+      target_branches:
+        description: 'Comma-separated list of specific branches to sync (leave empty to sync merged branch only)'
+        required: false
+        type: string
 
-# Workflow-level concurrency control for proper queueing
+# Branch-level concurrency control - allows parallel syncs for different branches
 concurrency:
-  group: sync-to-public-mirror-${{ github.repository }}
-  cancel-in-progress: false  # Queue workflows to ensure all merges are processed
+  group: sync-public-mirror-${{ github.repository }}-${{ github.event.pull_request.base.ref || github.event.client_payload.branch || github.event.inputs.target_branches || 'default' }}
+  cancel-in-progress: false  # Queue per branch to ensure all changes are synced
 
 jobs:
   call-sync-workflow:
-    # Only run this job when the PR was merged, not just closed
-    if: github.event.pull_request.merged == true || github.event_name == 'workflow_dispatch'
+    # Only run this job when the PR was merged, not just closed, OR when manually triggered, OR via repository_dispatch
+    if: github.event.pull_request.merged == true || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch'
     uses: thoughtspot/workflows/.github/workflows/sync-to-public-mirror.yml@main
     with:
-      force_sync: ${{ github.event.inputs.force_sync == 'true' || github.event_name == 'pull_request' }}
-      public_repo_name: ${{ github.event.inputs.public_repo_name || '' }}
-      # Pass additional context for better logging
+      # CRITICAL FIX: Only force sync when explicitly requested, not on every PR
+      force_sync: ${{ github.event.inputs.force_sync == true || (github.event_name == 'repository_dispatch' && github.event.client_payload.force_sync == true) }}
+      
+      public_repo_name: ${{ github.event.inputs.public_repo_name || github.event.client_payload.public_repo_name || '' }}
+      
+      # Optimization: Pass specific target branches instead of syncing all
+      target_branches: ${{ github.event.inputs.target_branches || github.event.client_payload.target_branches || (github.event_name == 'pull_request' && github.event.pull_request.base.ref) || '' }}
+      
+      # Enhanced context for better logging and traceability
       trigger_type: ${{ github.event_name }}
-      pr_number: ${{ github.event.pull_request.number || '' }}
-      merged_branch: ${{ github.event.pull_request.head.ref || '' }}
-      merge_commit_sha: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+      pr_number: ${{ github.event.pull_request.number || github.event.client_payload.pr_number || '' }}
+      
+      # CRITICAL FIX: Use base.ref (target branch) instead of head.ref (source branch)
+      merged_branch: ${{ github.event.pull_request.base.ref || github.event.client_payload.branch || '' }}
+      
+      merge_commit_sha: ${{ github.event.pull_request.merge_commit_sha || github.event.client_payload.commit_sha || github.sha }}
     secrets:
       SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
